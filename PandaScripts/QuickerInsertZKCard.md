@@ -1,8 +1,12 @@
 await ea.addElementsToView();
-const quickaddApi = this.app.plugins.plugins.quickadd.api;
 // const ea = ExcalidrawAutomate;
 const path = require("path");
 const fs = require("fs");
+
+/** 用 Obsidian 内置 moment 格式化时间（替代 QuickAdd date.now） */
+function formatNow(fmt) {
+	return window.moment().format(fmt);
+}
 
 // 设置quickerInsetNote模板设置
 let settings = ea.getScriptSettings();
@@ -41,7 +45,7 @@ const folderPath = settings["QuickerInsertZKCardPath"].value ? settings["Quicker
 console.log(folderPath);
 
 // 调用函数生成时间戳
-const timestamp = quickaddApi.date.now(settings["QuickerInsertZKCardTemplate"].value);
+const timestamp = formatNow(settings["QuickerInsertZKCardTemplate"].value);
 console.log(timestamp);
 
 // 创建文件夹路径下的Markdown文件，fname为文件名
@@ -66,30 +70,34 @@ console.log(insertImageName);
 ea.setView("active");
 const trashFiles = ea.getViewSelectedElements().filter(el => el.link);
 
-// 获取库所有文件列表
-const files = app.vault.getFiles();
+if (trashFiles.length) {
+	const sourcePath = ea.targetView?.file?.path || app.workspace.getActiveFile()?.path || "";
 
-if (Object.keys(trashFiles).length) {
+	for (const trashFile of trashFiles) {
+		const linkedFile = resolveLinkedFile(trashFile, sourcePath);
+		const label = linkedFile ? linkedFile.path : String(trashFile.link || "未找到对应笔记");
+		const isConfirm = await yesNoPromptCompat("是否删除本地文件", label);
+		if (!isConfirm) continue;
 
-	for (let trashFile of trashFiles) {
-		filePaths = getFilePath(files, trashFile);
-		let isConfirm = await quickaddApi.yesNoPrompt("是否删除本地文件", `${filePaths}`);
+		// 删除画布元素
+		ea.deleteViewElements([trashFile]);
 
-		if (isConfirm) {
-			// 删除元素
-			ea.deleteViewElements(ea.getViewSelectedElements().filter(el => el.id == trashFile.id));
-
-			// 删除文件
-			if ((app.vault.adapter).exists(filePaths)) {
-				(app.vault.adapter).trashLocal(filePaths);
+		// 删除本地笔记
+		if (linkedFile) {
+			try {
+				await app.vault.trash(linkedFile, true);
+			} catch (err) {
+				console.error("QuickerInsertZKCard trash failed", err);
+				new ea.obsidian.Notice(`删除失败: ${linkedFile.path}`);
 			}
+		} else {
+			new ea.obsidian.Notice(`未找到对应笔记: ${trashFile.link}`);
 		}
-
 	}
+
 	await ea.addElementsToView(false, true);
 	await ea.getExcalidrawAPI().history.clear(); //避免撤消/重做扰乱
-	return; // 提前结束函数的执行
-
+	return;
 }
 
 // 配置按钮
@@ -143,7 +151,7 @@ fileAlistName = await utils.inputPrompt(
 );
 
 // 时间戳笔记路径
-const timestamp2 = quickaddApi.date.now("YYYY-MM-DD");
+const timestamp2 = formatNow("YYYY-MM-DD");
 const filePath = fileAlistName ? `${timestamp2}_${fileAlistName}` : `${folderPath}/${timestamp}`;
 
 console.log(filePath);
@@ -298,10 +306,78 @@ async function openEditPrompt(Text = "") {
 	return { insertType, inputText };
 }
 
-// 由文件列表和el元素获取文件路径(相对路径)
-function getFilePath(files, el) {
-	let files2 = files.filter(f => path.basename(f.path).replace(".md", "").endsWith(el.link.replace(/\[\[/, "").replace(/\|.*]]/, "").replace(/\]\]/, "").replace(".md", "")));
-	let filePath = files2.map((f) => f.path)[0];
-	console.log(filePath);
-	return filePath;
+/** 从元素 link 解析 vault 文件（支持 [[path|alias]] / path#heading） */
+function resolveLinkedFile(el, sourcePath = "") {
+	const raw = String(el?.link || "").trim();
+	if (!raw) return null;
+
+	const linkpath = raw
+		.replace(/^\[\[/, "")
+		.replace(/\]\]$/, "")
+		.split("|")[0]
+		.split("#")[0]
+		.trim();
+	if (!linkpath) return null;
+
+	const dest = app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
+	if (dest) return dest;
+
+	const byPath =
+		app.vault.getAbstractFileByPath(linkpath) ||
+		app.vault.getAbstractFileByPath(linkpath.endsWith(".md") ? linkpath : `${linkpath}.md`);
+	if (byPath) return byPath;
+
+	const base = path.basename(linkpath).replace(/\.md$/i, "");
+	return app.vault.getFiles().find((f) => f.basename === base) || null;
+}
+
+/**
+ * Yes/No 确认框（不依赖 QuickAdd）。
+ * 只在 onClose 里 resolve，避免按钮与关闭竞态。
+ */
+function yesNoPromptCompat(header, text) {
+	return new Promise((resolve) => {
+		const { Modal, ButtonComponent } = ea.obsidian;
+
+		class ConfirmModal extends Modal {
+			constructor(app) {
+				super(app);
+				this.answer = false;
+			}
+
+			onOpen() {
+				this.titleEl.setText(header);
+				if (text) this.contentEl.createEl("p", { text: String(text) });
+
+				const row = this.contentEl.createDiv({ cls: "modal-button-container" });
+
+				new ButtonComponent(row)
+					.setButtonText("取消")
+					.onClick(() => {
+						this.answer = false;
+						this.close();
+					});
+
+				const yesBtn = new ButtonComponent(row).setButtonText("删除");
+				if (typeof yesBtn.setDestructive === "function") {
+					yesBtn.setDestructive();
+				} else if (typeof yesBtn.setWarning === "function") {
+					yesBtn.setWarning();
+				} else {
+					yesBtn.setCta();
+				}
+				yesBtn.onClick(() => {
+					this.answer = true;
+					this.close();
+				});
+				yesBtn.buttonEl.focus();
+			}
+
+			onClose() {
+				resolve(this.answer);
+			}
+		}
+
+		new ConfirmModal(app).open();
+	});
 }
